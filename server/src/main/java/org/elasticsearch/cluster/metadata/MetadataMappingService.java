@@ -25,7 +25,6 @@ import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.compress.CompressedXContent;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexSettingProvider;
@@ -34,14 +33,10 @@ import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.mapper.DocumentMapper;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.MapperService.MergeReason;
-import org.elasticsearch.index.mapper.Mapping;
 import org.elasticsearch.indices.IndicesService;
 import org.elasticsearch.injection.guice.Inject;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.io.IOException;
 
 /**
  * Service responsible for submitting mapping changes
@@ -115,122 +110,68 @@ public class MetadataMappingService {
 
         @Override
         public ClusterState execute(BatchExecutionContext<PutMappingClusterStateUpdateTask> batchExecutionContext) throws Exception {
-            Map<Index, MapperService> indexMapperServices = new HashMap<>();
-            try {
-                var currentState = batchExecutionContext.initialState();
-                for (final var taskContext : batchExecutionContext.taskContexts()) {
-                    final var task = taskContext.getTask();
-                    final PutMappingClusterStateUpdateRequest request = task.request;
-                    try (var ignored = taskContext.captureResponseHeaders()) {
-                        for (Index index : request.indices()) {
-                            final IndexMetadata indexMetadata = currentState.metadata().indexMetadata(index);
-                            if (indexMapperServices.containsKey(indexMetadata.getIndex()) == false) {
-                                MapperService mapperService = indicesService.createIndexMapperServiceForValidation(indexMetadata);
-                                indexMapperServices.put(index, mapperService);
-                                // add mappings for all types, we need them for cross-type validation
-                                mapperService.merge(indexMetadata, MergeReason.MAPPING_RECOVERY);
-                            }
-                        }
-                        currentState = applyRequest(currentState, request, indexMapperServices);
-                        taskContext.success(task);
-                    } catch (Exception e) {
-                        taskContext.onFailure(e);
-                    }
+            var currentState = batchExecutionContext.initialState();
+            for (final var taskContext : batchExecutionContext.taskContexts()) {
+                final var task = taskContext.getTask();
+                final PutMappingClusterStateUpdateRequest request = task.request;
+                try (var ignored = taskContext.captureResponseHeaders()) {
+                    currentState = applyRequest(currentState, request);
+                    taskContext.success(task);
+                } catch (Exception e) {
+                    taskContext.onFailure(e);
                 }
-                return currentState;
-            } finally {
-                IOUtils.close(indexMapperServices.values());
             }
+            return currentState;
         }
 
-        private ClusterState applyRequest(
-            ClusterState currentState,
-            PutMappingClusterStateUpdateRequest request,
-            Map<Index, MapperService> indexMapperServices
-        ) {
-
+        private ClusterState applyRequest(ClusterState currentState, PutMappingClusterStateUpdateRequest request) throws IOException {
             final CompressedXContent mappingUpdateSource = request.source();
             final Metadata metadata = currentState.metadata();
-            final List<IndexMetadata> updateList = new ArrayList<>();
             MergeReason reason = request.autoUpdate() ? MergeReason.MAPPING_AUTO_UPDATE : MergeReason.MAPPING_UPDATE;
-            for (Index index : request.indices()) {
-                MapperService mapperService = indexMapperServices.get(index);
-                // IMPORTANT: always get the metadata from the state since it get's batched
-                // and if we pull it from the indexService we might miss an update etc.
-                final IndexMetadata indexMetadata = metadata.indexMetadata(index);
-                DocumentMapper existingMapper = mapperService.documentMapper();
-                if (existingMapper != null && existingMapper.mappingSource().equals(mappingUpdateSource)) {
-                    continue;
-                }
-                // this is paranoia... just to be sure we use the exact same metadata tuple on the update that
-                // we used for the validation, it makes this mechanism little less scary (a little)
-                updateList.add(indexMetadata);
-                // try and parse it (no need to add it here) so we can bail early in case of parsing exception
-                // first, simulate: just call merge and ignore the result
-                Mapping mapping = mapperService.parseMapping(MapperService.SINGLE_MAPPING_NAME, reason, mappingUpdateSource);
-                MapperService.mergeMappings(mapperService.documentMapper(), mapping, reason, mapperService.getIndexSettings());
-            }
             Metadata.Builder builder = Metadata.builder(metadata);
             boolean updated = false;
-            for (IndexMetadata indexMetadata : updateList) {
-                boolean updatedMapping = false;
+            // TODO: we should first group the indices by project
+            for (Index index : request.indices()) {
+                final ProjectMetadata projectMetadata = metadata.projectFor(index);
+                final IndexMetadata indexMetadata = projectMetadata.index(index);
+                final DocumentMapper updatedDocMapper;
                 // do the actual merge here on the master, and update the mapping source
-                // we use the exact same indexService and metadata we used to validate above here to actually apply the update
-                final Index index = indexMetadata.getIndex();
-                final MapperService mapperService = indexMapperServices.get(index);
+                try (MapperService mapperService = indicesService.createIndexMapperServiceForValidation(indexMetadata)) {
+                    // add mappings for all types, we need them for cross-type validation
+                    mapperService.merge(indexMetadata, MergeReason.MAPPING_RECOVERY);
 
-                CompressedXContent existingSource = null;
-                DocumentMapper existingMapper = mapperService.documentMapper();
-                if (existingMapper != null) {
-                    existingSource = existingMapper.mappingSource();
-                }
-                DocumentMapper mergedMapper = mapperService.merge(MapperService.SINGLE_MAPPING_NAME, mappingUpdateSource, reason);
-                CompressedXContent updatedSource = mergedMapper.mappingSource();
-
-                if (existingSource != null) {
-                    if (existingSource.equals(updatedSource)) {
-                        // same source, no changes, ignore it
-                    } else {
-                        updatedMapping = true;
-                        // use the merged mapping source
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("{} update_mapping [{}] with source [{}]", index, mergedMapper.type(), updatedSource);
-                        } else if (logger.isInfoEnabled()) {
-                            logger.info("{} update_mapping [{}]", index, mergedMapper.type());
-                        }
-
+                    CompressedXContent existingSource = mapperService.documentMapper() != null
+                        ? mapperService.documentMapper().mappingSource()
+                        : null;
+                    DocumentMapper mergedMapper = mapperService.merge(MapperService.SINGLE_MAPPING_NAME, mappingUpdateSource, reason);
+                    CompressedXContent updatedSource = mergedMapper.mappingSource();
+                    if (updatedSource.equals(existingSource)) {
+                        continue;
                     }
-                } else {
-                    updatedMapping = true;
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("{} create_mapping with source [{}]", index, updatedSource);
-                    } else if (logger.isInfoEnabled()) {
-                        logger.info("{} create_mapping", index);
-                    }
+
+                    logMappingResult(index, existingSource, updatedSource, mergedMapper);
+                    // Mapping updates on a single type may have side-effects on other types so we need to
+                    // update mapping metadata on all types
+                    updatedDocMapper = mapperService.documentMapper();
                 }
 
                 IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(indexMetadata);
-                // Mapping updates on a single type may have side-effects on other types so we need to
-                // update mapping metadata on all types
-                DocumentMapper docMapper = mapperService.documentMapper();
-                if (docMapper != null) {
-                    indexMetadataBuilder.putMapping(new MappingMetadata(docMapper));
-                    indexMetadataBuilder.putInferenceFields(docMapper.mappers().inferenceFields());
+                if (updatedDocMapper != null) {
+                    indexMetadataBuilder.putMapping(new MappingMetadata(updatedDocMapper));
+                    indexMetadataBuilder.putInferenceFields(updatedDocMapper.mappers().inferenceFields());
                 }
                 boolean updatedSettings = false;
                 final Settings.Builder additionalIndexSettings = Settings.builder();
-                if (updatedMapping) {
-                    indexMetadataBuilder.mappingVersion(1 + indexMetadataBuilder.mappingVersion())
-                        .mappingsUpdatedVersion(IndexVersion.current());
-                    for (IndexSettingProvider provider : indexSettingProviders.getIndexSettingProviders()) {
-                        Settings.Builder newAdditionalSettingsBuilder = Settings.builder();
-                        provider.onUpdateMappings(indexMetadata, docMapper, newAdditionalSettingsBuilder);
-                        if (newAdditionalSettingsBuilder.keys().isEmpty() == false) {
-                            Settings newAdditionalSettings = newAdditionalSettingsBuilder.build();
-                            MetadataCreateIndexService.validateAdditionalSettings(provider, newAdditionalSettings, additionalIndexSettings);
-                            additionalIndexSettings.put(newAdditionalSettings);
-                            updatedSettings = true;
-                        }
+                indexMetadataBuilder.mappingVersion(1 + indexMetadataBuilder.mappingVersion())
+                    .mappingsUpdatedVersion(IndexVersion.current());
+                for (IndexSettingProvider provider : indexSettingProviders.getIndexSettingProviders()) {
+                    Settings.Builder newAdditionalSettingsBuilder = Settings.builder();
+                    provider.onUpdateMappings(indexMetadata, updatedDocMapper, newAdditionalSettingsBuilder);
+                    if (newAdditionalSettingsBuilder.keys().isEmpty() == false) {
+                        Settings newAdditionalSettings = newAdditionalSettingsBuilder.build();
+                        MetadataCreateIndexService.validateAdditionalSettings(provider, newAdditionalSettings, additionalIndexSettings);
+                        additionalIndexSettings.put(newAdditionalSettings);
+                        updatedSettings = true;
                     }
                 }
                 if (updatedSettings) {
@@ -245,13 +186,39 @@ public class MetadataMappingService {
                  * already incremented the mapping version if necessary. Therefore, the mapping version increment must remain before this
                  * statement.
                  */
-                builder.getProject(metadata.projectFor(index).id()).put(indexMetadataBuilder);
-                updated |= updatedMapping;
+                builder.getProject(projectMetadata.id()).put(indexMetadataBuilder);
+                updated = true;
             }
             if (updated) {
                 return ClusterState.builder(currentState).metadata(builder).build();
             } else {
                 return currentState;
+            }
+        }
+
+        private void logMappingResult(
+            Index index,
+            CompressedXContent existingSource,
+            CompressedXContent updatedSource,
+            DocumentMapper mergedMapper
+        ) {
+            if (existingSource != null) {
+                if (existingSource.equals(updatedSource)) {
+                    // same source, no changes, ignore it
+                } else {
+                    // use the merged mapping source
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("{} update_mapping [{}] with source [{}]", index, mergedMapper.type(), updatedSource);
+                    } else if (logger.isInfoEnabled()) {
+                        logger.info("{} update_mapping [{}]", index, mergedMapper.type());
+                    }
+                }
+            } else {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("{} create_mapping with source [{}]", index, updatedSource);
+                } else if (logger.isInfoEnabled()) {
+                    logger.info("{} create_mapping", index);
+                }
             }
         }
 
@@ -280,7 +247,22 @@ public class MetadataMappingService {
                 noop = false;
                 break;
             }
-            if (request.source().equals(mappingMetadata.source()) == false) {
+            try (MapperService mapperService = indicesService.createIndexMapperServiceForValidation(indexMetadata)) {
+                mapperService.merge(indexMetadata, MergeReason.MAPPING_RECOVERY);
+                DocumentMapper mergedMapper = mapperService.merge(
+                    MapperService.SINGLE_MAPPING_NAME,
+                    request.source(),
+                    MergeReason.MAPPING_UPDATE
+                );
+                CompressedXContent updatedSource = mergedMapper.mappingSource();
+                logger.info(updatedSource.toString());
+                logger.info(mappingMetadata.source().toString());
+                if (updatedSource.equals(mappingMetadata.source()) == false) {
+                    logger.info("Mapping update required for index {}", index);
+                    noop = false;
+                    break;
+                }
+            } catch (Exception e) {
                 noop = false;
                 break;
             }
